@@ -1,0 +1,324 @@
+---
+title: "01-qc_normalization"
+author: "Ramon Massoni-Badosa"
+date: "7/4/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+In this notebook, we will assess differences in Peripheral Blood Mononuclear Cells (PBMC) storage. Particularly, we have the following conditions:
+
+- Fresh
+- Cryopreserved
+- Methanol
+
+# Preprocessing
+
+## Package loading
+
+```{r}
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(DoubletFinder)
+library(biomaRt)
+library(tidyverse)
+```
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+
+```{r}
+# Define libraries paths
+libraries <- c("Hislet_cryo", "Hislet_fresh", "Hislet_metOH")
+lib_paths <- str_c("data/", libraries, "/filtered_feature_bc_matrix/")
+
+# Load data and join into a single sparse matrix
+matrix_list <- map(lib_paths, Read10X)
+barcodes_list <- map(matrix_list, colnames)
+names(barcodes_list) <- str_remove(string = libraries, pattern = "Hislet_")
+expression_matrix <- Reduce(cbind, matrix_list)
+
+# Create SingleCellExperiment object
+cell_metadata <- barcodes_list %>% 
+  map(as.data.frame) %>% 
+  bind_rows(.id = "storage")
+colnames(cell_metadata) <- c("storage", "barcodes")
+rownames(cell_metadata) <- str_c(
+  cell_metadata$barcodes, 
+  ".", 
+  as.character(1:nrow(cell_metadata))
+)
+colnames(expression_matrix) <- rownames(cell_metadata) 
+row_metadata <- read_tsv(
+  gzfile("data/Hislet_cryo/filtered_feature_bc_matrix/features.tsv.gz"), 
+  col_names = FALSE
+)
+row_metadata <- as.data.frame(row_metadata)
+rownames(row_metadata) <- rownames(expression_matrix)
+pbmc <- SingleCellExperiment(
+  assays = list(counts = expression_matrix),
+  colData = cell_metadata,
+  rowData = row_metadata
+)
+
+# Eliminate genes not expressed in any cell
+pbmc <- pbmc[rowSums(as.matrix(counts(pbmc))) > 0, ]
+
+# Define mitochondrial genes
+isSpike(pbmc, "MT") <- str_subset(rownames(pbmc), "^MT-")
+
+pbmc
+```
+
+# Cell QC
+
+Calculate QC metrics:
+
+```{r}
+pbmc <- calculateQCMetrics(pbmc)
+```
+
+Assess how library size, number of detected genes and % of mitochondrial expression vary between conditions:
+
+```{r}
+qc_metrics <- c("total_counts", "total_features_by_counts", "pct_counts_MT")
+qc_metrics_gg <- map(qc_metrics, function(qc) {
+  colData(pbmc) %>%
+    as.data.frame() %>% 
+    ggplot(aes_string("storage", qc)) +
+      geom_violin(fill = "red") +
+      geom_boxplot(outlier.shape = NA, fill = "white", width = 0.25) +
+      scale_y_log10() +
+      theme_classic()
+})
+ggarrange(plotlist = qc_metrics_gg, nrow = 1, ncol = 3)
+```
+
+According to the previous plots, we can treat all conditions together in the QC filtering. Worthnoting, methanol samples have a lowered percentage of mitochondrial expression
+
+### Library size
+
+```{r}
+plot_histogram(
+  sce = pbmc, 
+  qc_metric = "total_counts", 
+  title = "Library Size (total UMI)", 
+  log_scale = TRUE
+)
+```
+
+### Number of detected genes
+
+```{r}
+plot_histogram(
+  sce = pbmc, 
+  qc_metric = "total_features_by_counts", 
+  title = "Number of detected genes", 
+  log_scale = TRUE
+)
+```
+
+### Mitochondrial expression
+
+```{r}
+plot_histogram(
+  sce = pbmc, 
+  qc_metric = "pct_counts_MT", 
+  title = "% mitochondrial expression", 
+  log_scale = FALSE
+)
+```
+
+### Joint distribution
+
+To accurately determine which threshold to use to discard cells is essential to look how the qc metrics covary. For instance, cells with a high mitochondrial expression can be undergoing apoptosis (which we aim to discard) or possess a high metabolic rate (like cardyomyocytes). Assessing this metric together with the library size can discriminate both scenarios:
+
+```{r}
+plot_scatter(
+  sce = pbmc, 
+  qc_metrics = c("total_counts", "pct_counts_MT"), 
+  alpha = 0.5,
+  title_x = "Library Size (total UMI)",
+  title_y = "% mitochondrial expression",
+  log_x = TRUE,
+  log_y = FALSE
+)
+```
+
+We can do the same with number of detected genes and library size:
+
+```{r}
+plot_scatter(
+  sce = pbmc, 
+  qc_metrics = c("total_counts", "total_features_by_counts"), 
+  alpha = 0.5,
+  title_x = "Library Size (total UMI)",
+  title_y = "Number of detected genes",
+  log_x = TRUE,
+  log_y = TRUE
+)
+```
+
+Judging by all the former plots, we decide the following QC thresholds:
+
+- Library size: 1000
+- Number of detected genes: 300
+- % mitochondrial expression: 25
+
+```{r}
+lysed_cells <- !(pbmc$total_counts > 1000 & pbmc$total_features_by_counts > 300 & pbmc$pct_counts_MT < 25)
+table(lysed_cells)
+pbmc$is_lysed <- lysed_cells
+```
+
+Let us assess if the predicted lysed cells cluster together:
+
+```{r}
+pbmc <- runTSNE(pbmc, exprs_values = "counts")
+tsne_poor <- reducedDim(pbmc) %>% 
+  as.data.frame() %>% 
+  set_names(c("tSNE1", "tSNE2")) %>% 
+  mutate(is_lysed = lysed_cells) %>% 
+  ggplot(aes(tSNE1, tSNE2, color = is_lysed)) +
+    geom_point() +
+    scale_color_manual("lysed cells", values = c("gray62", "red2")) +
+    theme_classic2()
+tsne_poor
+```
+
+Filter cells:
+
+```{r}
+pbmc <- pbmc[, !lysed_cells]
+```
+
+
+## Gene QC
+Let us compute the number of cells that each gene has at least 1 UMI:
+
+```{r}
+n_cells <- rowSums(as.matrix(counts(pbmc)) > 0)
+gene_qc_gg <- n_cells %>% 
+  as.data.frame() %>% 
+  ggplot(aes(n_cells)) + 
+    geom_histogram(bins = 100, alpha = 0.75) +
+    scale_x_log10("Number of cells") +
+    theme_bw() 
+gene_qc_gg
+```
+
+We see two peaks, the firt one of which corresponds to lowly expressed genes. As explained in [Luecken MD et al.](https://www.embopress.org/doi/pdf/10.15252/msb.20188746): "a guideline to setting this threshold is to use the minimum cell cluster size that is of interest and leaving some leeway for dropout effects". As we will not rely on clusters that have fewer than 15 cells, we will use it as a filter:
+
+```{r}
+pbmc <- pbmc[n_cells > 15, ]
+pbmc
+```
+
+### Identify highly expressed genes
+As a validation, let us check whether the highest expressed genes are housekeeping genes like ACTB:
+
+```{r}
+plotHighestExprs(pbmc, feature_names_to_plot = "name")
+```
+
+# Normalization
+To normalize for differences in library size and RNA composition, we will use the `scran` package:
+
+```{r}
+pbmc <- computeSumFactors(pbmc)
+summary(sizeFactors(pbmc))
+pbmc <- normalize(pbmc)
+assays(pbmc)
+logcounts(pbmc)[1:6, 1:6]
+plot(sizeFactors(pbmc) ~ pbmc$total_counts)
+```
+
+# Cell cycle scoring
+Finally, we seek to elucidate if there are differences in cell cycle between cells. This an important QC step, as otherwise we might annotate as different cell types different cell steps. To that end, we will score each cell based on the expression of two gene signatures S and G2M cell cycle phases. This signatures are loaded by default with Seurat.
+
+To score cells with the cell cycle phase signatures, we will use the `CellCycleScoring` function from Seurat. Thus, we will convert our `SingleCellExperiment` to a `Seurat` object:
+
+```{r}
+# Convert to Seurat object
+pbmc_seu <- as.Seurat(pbmc, to = "seurat")
+
+# Find Highly Variable genes and scale data
+pbmc_seu <- FindVariableFeatures(pbmc_seu, do.plot = TRUE)
+pbmc_seu <- ScaleData(pbmc_seu)
+pbmc_seu <- RunPCA(pbmc_seu)
+ElbowPlot(pbmc_seu)
+pbmc_seu <- FindNeighbors(pbmc_seu, dims = 1:6)
+
+# Score cells using cell cycle signatures
+pbmc_seu <- CellCycleScoring(
+  pbmc_seu, 
+  s.features = cc.genes$s.genes, 
+  g2m.features = cc.genes$g2m.genes
+)
+```
+
+We can now visualize this scores in UMAP space:
+
+```{r}
+pbmc_seu <- RunUMAP(pbmc_seu, dims = 1:6)
+umaps_scores <- map(c("S.Score", "G2M.Score"), function(score) {
+  pbmc_seu@meta.data %>% 
+  mutate(UMAP1 = pbmc_seu@reductions$umap@cell.embeddings[, 1],
+         UMAP2 = pbmc_seu@reductions$umap@cell.embeddings[, 2],
+         score_phase = pbmc_seu@meta.data[, score]) %>% 
+  ggplot(aes(UMAP1, UMAP2, color = score_phase)) +
+  geom_point(size = 0.8) +
+  labs(x = "UMAP1", y = "UMAP2", color = score) +
+  scale_colour_gradient2() +
+  theme_classic2() +
+  guides(colour = guide_legend(override.aes = list(size = 3))) 
+})
+ggarrange(plotlist = umaps_scores, ncol = 2, nrow = 1)
+```
+
+# Save Seurat object
+
+```{r}
+saveRDS(object = pbmc_seu, "results/R_objects/pbmc_seurat_filtered_normalized.rds")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
+# DoubletFinder
+
+```{r}
+pbmc_seu$storage <- as.factor(pbmc_seu$storage)
+Idents(pbmc_seu) <- pbmc_seu$storage
+a <- subset(pbmc_seu, subset = storage == "cryo")
+storages <- unique(pbmc_seu$storage)
+pbmc_list <- map(storages, function(cond) {
+  seu <- subset(pbmc_seu, subset = storage == cond)
+  seu
+})
+pbmc_cryo <- subset(pbmc_seu, subset = storage == "cryo")
+pbmc_fresh <- subset(pbmc_seu, subset = storage == "fresh")
+pbmc_metoh <- subset(pbmc_seu, subset = storage == "metOH")
+pbmc_list <- list(cryo = pbmc_cryo, fresh = pbmc_fresh, metoh = pbmc_metoh)
+
+## pK Identification (no ground-truth) 
+sweep.res.list <- paramSweep_v3(pbmc_cryo, PCs = 1:10, sct = FALSE)
+sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+bcmvn <- find.pK(sweep.stats)
+
+```
+
