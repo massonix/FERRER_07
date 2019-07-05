@@ -1,0 +1,56 @@
+---
+title: "02-clustering"
+author: "Ramon Massoni-Badosa"
+date: "7/5/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Pre-processing
+
+## Load packages
+
+```{r}
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(DoubletFinder)
+library(biomaRt)
+library(purrr)
+library(tidyverse)
+```
+
+## Source script
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+
+```{r}
+pbmc_seu <- readRDS("results/R_objects/pbmc_seurat_filtered_normalized.rds")
+```
+
+# Clustering
+
+```{r}
+# Find clusters
+pbmc_seu <- FindClusters(pbmc_seu, resolution = 0.2)
+
+# Run tSNE
+pbmc_seu <- RunTSNE(pbmc_seu, dims = 1:6)
+
+# Visualize PCA, tSNE and UMAP
+dim_red <- c("pca", "tsne", "umap")
+dim_plots <- map(dim_red, ~ DimPlot(pbmc_seu, reduction = .))
+dim_plots
+```
+```{r}
+Idents(pbmc_seu) <- pbmc_seu$storage
+```
+
